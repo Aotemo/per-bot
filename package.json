@@ -1,0 +1,36 @@
+{
+  "name": "per-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Owner's assistant in Feishu, grounded in the Knowledge Base",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "dev": "tsx watch src/main.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "check": "npm run typecheck && npm run lint"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.77.0",
+    "better-sqlite3": "^13.2.0",
+    "dotenv": "^18.0.10",
+    "sqlite-vec": "^0.1.9",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.6.8",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.6.6",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.1"
+  }
+}

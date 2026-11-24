@@ -1,0 +1,23 @@
+owner:
+  openId: ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+allowedGroups:
+  - oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+repositories:
+  - owner/private-repo
+
+bot:
+  chatModel: qwen3:14b
+  embeddingModel: bge-m3
+
+rateLimit:
+  maxRequests: 10
+  windowSeconds: 60
+
+memory:
+  proposalTtlDays: 7
+  extractionIdleMinutes: 30
+
+storage:
+  database: ./data/per_bot.db
