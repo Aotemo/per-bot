@@ -1,6 +1,7 @@
 import type { Clock } from "../../src/ports/clock";
 import type {
   FeishuPort,
+  GroupMember,
   InteractiveCard,
   PrivateMessage,
   ReplyInTopic,
@@ -22,16 +23,26 @@ export type FakeFeishu = FeishuPort & {
   replies: ReplyInTopic[];
   privateMessages: PrivateMessage[];
   cards: RecordedCard[];
-  groupMembers: Map<string, string[]>;
+  groupMembers: Map<string, GroupMember[]>;
   groupMemberLookups: string[];
   files: Map<string, Buffer>;
 };
 
-export function createFakeFeishu(initialGroups: Record<string, string[]> = {}): FakeFeishu {
+/** Group members may be given as bare open_ids (no display name) or full members. */
+export function createFakeFeishu(
+  initialGroups: Record<string, Array<string | GroupMember>> = {},
+): FakeFeishu {
   const replies: ReplyInTopic[] = [];
   const privateMessages: PrivateMessage[] = [];
   const cards: RecordedCard[] = [];
-  const groupMembers = new Map<string, string[]>(Object.entries(initialGroups));
+  const groupMembers = new Map<string, GroupMember[]>(
+    Object.entries(initialGroups).map(([chatId, members]) => [
+      chatId,
+      members.map((member) =>
+        typeof member === "string" ? { openId: member, name: null } : member,
+      ),
+    ]),
+  );
   const groupMemberLookups: string[] = [];
   const files = new Map<string, Buffer>();
   let nextCardNumber = 1;
@@ -80,6 +91,8 @@ export type FakeLlm = LlmPort & {
   requests: ChatRequest[];
   embedCalls: string[][];
   offline: boolean;
+  /** Embedding any text containing this marker fails while the model stays healthy. */
+  failEmbedMarker: string | null;
   inFlight: number;
   maxInFlight: number;
   setOffline(offline: boolean): void;
@@ -94,6 +107,7 @@ export function createFakeLlm(script: ScriptedReply[] = []): FakeLlm {
     requests,
     embedCalls,
     offline: false,
+    failEmbedMarker: null,
     inFlight: 0,
     maxInFlight: 0,
     setOffline(offline) {
@@ -135,6 +149,10 @@ export function createFakeLlm(script: ScriptedReply[] = []): FakeLlm {
     async embed(texts) {
       if (fake.offline) {
         throw new Error("model offline");
+      }
+      const marker = fake.failEmbedMarker;
+      if (marker && texts.some((text) => text.includes(marker))) {
+        throw new Error("embedding failed");
       }
       embedCalls.push(texts);
       return texts.map((text) => deterministicEmbedding(text));

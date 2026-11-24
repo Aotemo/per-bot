@@ -19,6 +19,7 @@ async function main(): Promise<void> {
   const llm = createOllamaLlm({
     baseUrl: config.ollama.url,
     embeddingModel: config.embeddingModel,
+    contextTokens: config.contextTokens,
   });
 
   const feishu = createFeishuAdapter(config.feishu);

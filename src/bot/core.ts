@@ -3,6 +3,7 @@ import type {
   InboundEvent,
   InboundFile,
   InboundMessage,
+  Sender,
 } from "../domain/inbound";
 import {
   chunkText,
@@ -11,7 +12,7 @@ import {
   serializeEmbedding,
 } from "../knowledge/documents";
 import type { Clock } from "../ports/clock";
-import type { FeishuPort } from "../ports/feishu";
+import type { FeishuPort, GroupMember } from "../ports/feishu";
 import type { ChatMessage, LlmPort, ToolDefinition } from "../ports/llm";
 import type { RepositorySyncPort } from "../ports/repository-sync";
 import type { Storage } from "../storage/database";
@@ -55,10 +56,15 @@ const DEFAULT_SYNC_INTERVAL_MS = 60 * 60 * 1000;
 const DEFAULT_RATE_LIMIT: RateLimitSettings = { maxRequests: 10, windowSeconds: 60 };
 const DEFAULT_MEMORY_SETTINGS: MemorySettings = { proposalTtlDays: 7, extractionIdleMinutes: 30 };
 const MAX_TOOL_ROUNDS = 5;
+const MAX_HISTORY_MESSAGES = 20;
+const MAX_EXTRACTION_MESSAGES = 60;
+const EMBED_BATCH_SIZE = 16;
 const NO_PERMISSION_REPLY = "Sorry, you do not have permission to use this bot.";
 const MODEL_OFFLINE_REPLY = "The model is currently offline. Please try again later.";
 const RATE_LIMITED_REPLY = "You have reached the rate limit. Please wait a moment and try again.";
 const THINKING_REPLY = "Thinking...";
+const NO_ANSWER_REPLY = "Sorry, I could not produce an answer. Please try rephrasing.";
+const DOCS_GROUP_REPLY = "Use /docs in a private chat with the bot to manage your documents.";
 
 const SYSTEM_PROMPT = [
   "You are the personal assistant of the Owner, speaking on their behalf to people who talk to the bot.",
@@ -146,6 +152,7 @@ export function createBot(dependencies: BotDependencies): Bot {
   const extractionIdleMs = memorySettings.extractionIdleMinutes * 60 * 1000;
   let queueDepth = 0;
   let queueTail: Promise<void> = Promise.resolve();
+  let tickRunning = false;
 
   const countRateLimitEvents = db.prepare<[string, number], { count: number }>(
     "SELECT COUNT(*) AS count FROM rate_limit_events WHERE open_id = ? AND created_at > ?",
@@ -163,20 +170,25 @@ export function createBot(dependencies: BotDependencies): Bot {
   const deleteGroupMembers = db.prepare<[string]>(
     "DELETE FROM group_members_cache WHERE chat_id = ?",
   );
-  const insertGroupMember = db.prepare<[string, string]>(
-    "INSERT OR IGNORE INTO group_members_cache (chat_id, open_id) VALUES (?, ?)",
+  const insertGroupMember = db.prepare<[string, string, string | null]>(
+    "INSERT OR IGNORE INTO group_members_cache (chat_id, open_id, name) VALUES (?, ?, ?)",
+  );
+  const selectMemberName = db.prepare<[string], { name: string }>(
+    "SELECT name FROM group_members_cache WHERE open_id = ? AND name IS NOT NULL LIMIT 1",
   );
   const upsertGroupCacheMeta = db.prepare<[string, number]>(
     "INSERT INTO group_cache_meta (chat_id, fetched_at) VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET fetched_at = excluded.fetched_at",
   );
 
-  const saveGroupMembers = db.transaction((chatId: string, members: string[], nowMs: number) => {
-    deleteGroupMembers.run(chatId);
-    for (const openId of members) {
-      insertGroupMember.run(chatId, openId);
-    }
-    upsertGroupCacheMeta.run(chatId, nowMs);
-  });
+  const saveGroupMembers = db.transaction(
+    (chatId: string, members: GroupMember[], nowMs: number) => {
+      deleteGroupMembers.run(chatId);
+      for (const member of members) {
+        insertGroupMember.run(chatId, member.openId, member.name);
+      }
+      upsertGroupCacheMeta.run(chatId, nowMs);
+    },
+  );
 
   const upsertConversation = db.prepare<[string, string, string, number, number]>(
     `INSERT INTO conversations (topic_id, chat_id, chat_type, created_at, last_message_at)
@@ -252,6 +264,12 @@ export function createBot(dependencies: BotDependencies): Bot {
   );
   const markJobDone = db.prepare<[number, number]>(
     "UPDATE index_jobs SET status = 'done', completed_at = ? WHERE id = ?",
+  );
+  const markDocumentFailed = db.prepare<[number, number]>(
+    "UPDATE documents SET status = 'failed', updated_at = ? WHERE id = ?",
+  );
+  const markJobFailed = db.prepare<[number, number]>(
+    "UPDATE index_jobs SET status = 'failed', completed_at = ? WHERE id = ?",
   );
   const listOwnerDocs = db.prepare<
     [],
@@ -531,8 +549,20 @@ export function createBot(dependencies: BotDependencies): Bot {
     );
   }
 
+  function resolveSender(sender: Sender): Sender {
+    return {
+      openId: sender.openId,
+      name: sender.name ?? selectMemberName.get(sender.openId)?.name ?? null,
+    };
+  }
+
+  function describeUser(openId: string): string {
+    const name = selectMemberName.get(openId)?.name;
+    return name ? `${name} (${openId})` : openId;
+  }
+
   function formatHistoryMessages(topicId: string): ChatMessage[] {
-    const rows = selectConversationMessages.all(topicId);
+    const rows = selectConversationMessages.all(topicId).slice(-MAX_HISTORY_MESSAGES);
     return rows.map((row) => {
       if (row.role === "assistant") {
         return { role: "assistant", content: row.content };
@@ -580,6 +610,23 @@ export function createBot(dependencies: BotDependencies): Bot {
     }
   }
 
+  /** Embeds through the global LLM queue in small batches so indexing never competes with chat for the GPU. */
+  async function embedInBatches(texts: string[]): Promise<number[][]> {
+    const result: number[][] = [];
+    for (let start = 0; start < texts.length; start += EMBED_BATCH_SIZE) {
+      const batch = texts.slice(start, start + EMBED_BATCH_SIZE);
+      let vectors: number[][] = [];
+      await enqueueLlmWork(async () => {
+        vectors = await llm.embed(batch);
+      });
+      if (vectors.length !== batch.length) {
+        throw new Error(`Expected ${batch.length} embeddings, got ${vectors.length}`);
+      }
+      result.push(...vectors);
+    }
+    return result;
+  }
+
   async function processIndexJobs(): Promise<void> {
     const jobs = selectPendingJobs.all();
     if (jobs.length === 0) {
@@ -596,13 +643,21 @@ export function createBot(dependencies: BotDependencies): Bot {
         markJobDone.run(nowMs, job.job_id);
         continue;
       }
+      let embeddings: number[][];
       try {
-        const embeddings = await llm.embed(chunks.map((c) => c.content));
-        saveIndexedChunks(job.job_id, job.document_id, chunks, embeddings, clock.now().getTime());
+        embeddings = await embedInBatches(chunks.map((c) => c.content));
       } catch {
-        // LLM went offline mid-indexing; leave job pending for the next tick.
+        if (await llm.healthCheck()) {
+          // The model is up, so this document is the problem: fail it instead of blocking the queue.
+          const nowMs = clock.now().getTime();
+          markDocumentFailed.run(nowMs, job.document_id);
+          markJobFailed.run(nowMs, job.job_id);
+          continue;
+        }
+        // The model went offline mid-indexing; leave the job pending for the next tick.
         return;
       }
+      saveIndexedChunks(job.job_id, job.document_id, chunks, embeddings, clock.now().getTime());
     }
   }
 
@@ -630,7 +685,7 @@ export function createBot(dependencies: BotDependencies): Bot {
         const prefix = p.target_memory_id !== null ? `[Update #${p.target_memory_id}]` : "[Add]";
         return {
           id: String(p.id),
-          text: `${prefix} (${p.user_open_id}): ${p.content}`,
+          text: `${prefix} ${describeUser(p.user_open_id)}: ${p.content}`,
           actions: [
             {
               label: "Accept",
@@ -788,6 +843,11 @@ export function createBot(dependencies: BotDependencies): Bot {
 
   async function handleDocsCommand(message: InboundMessage, topicId: string): Promise<void> {
     const isOwner = message.sender.openId === settings.ownerOpenId;
+    if (!isOwner && message.chatType === "group") {
+      // Supplementary Document names must not be exposed in a group.
+      await feishu.replyInTopic({ chatId: message.chatId, topicId, text: DOCS_GROUP_REPLY });
+      return;
+    }
     const docs = isOwner
       ? listOwnerDocs.all()
       : listUserSupplementaryDocs.all(message.sender.openId);
@@ -845,12 +905,13 @@ export function createBot(dependencies: BotDependencies): Bot {
     });
   }
 
-  async function handleFile(event: InboundFile): Promise<void> {
-    const topicId = event.topicId ?? event.messageId;
-    if (event.chatType === "group" && !allowedGroupSet.has(event.chatId)) {
+  async function handleFile(inbound: InboundFile): Promise<void> {
+    const topicId = inbound.topicId ?? inbound.messageId;
+    if (inbound.chatType === "group" && !allowedGroupSet.has(inbound.chatId)) {
       return;
     }
-    const isUser = await isAuthorizedUser(event.sender.openId);
+    const isUser = await isAuthorizedUser(inbound.sender.openId);
+    const event: InboundFile = { ...inbound, sender: resolveSender(inbound.sender) };
     if (!isUser) {
       if (event.chatType === "private") {
         await feishu.replyInTopic({
@@ -1004,44 +1065,26 @@ export function createBot(dependencies: BotDependencies): Bot {
     }
   }
 
-  async function handleMessage(message: InboundMessage): Promise<void> {
-    const topicId = message.topicId ?? message.messageId;
+  async function handleMessage(inbound: InboundMessage): Promise<void> {
+    const topicId = inbound.topicId ?? inbound.messageId;
 
-    if (message.chatType === "group") {
-      const allowedGroup = allowedGroupSet.has(message.chatId);
-      if (!message.mentionsBot) {
-        if (allowedGroup) {
-          recordMessage(topicId, message.chatId, message.chatType, "user", message.text, {
-            messageId: message.messageId,
-            senderOpenId: message.sender.openId,
-            senderName: message.sender.name,
-          });
-        }
-        return;
-      }
-      const isUser = await isAuthorizedUser(message.sender.openId);
-      if (!isUser) {
-        await feishu.replyInTopic({
-          chatId: message.chatId,
-          topicId,
-          text: NO_PERMISSION_REPLY,
-        });
-        return;
-      }
-      if (!allowedGroup) {
-        return;
-      }
-    } else {
-      const isUser = await isAuthorizedUser(message.sender.openId);
-      if (!isUser) {
-        await feishu.replyInTopic({
-          chatId: message.chatId,
-          topicId,
-          text: NO_PERMISSION_REPLY,
-        });
-        return;
-      }
+    // In groups the bot only takes part when @-mentioned in an Allowed Group; other messages
+    // are neither answered nor recorded, so they never reach context or Memory extraction.
+    if (
+      inbound.chatType === "group" &&
+      (!inbound.mentionsBot || !allowedGroupSet.has(inbound.chatId))
+    ) {
+      return;
     }
+    if (!(await isAuthorizedUser(inbound.sender.openId))) {
+      await feishu.replyInTopic({
+        chatId: inbound.chatId,
+        topicId,
+        text: NO_PERMISSION_REPLY,
+      });
+      return;
+    }
+    const message: InboundMessage = { ...inbound, sender: resolveSender(inbound.sender) };
 
     const trimmed = message.text.trim();
     if (trimmed === "/docs" || trimmed.startsWith("/docs ")) {
@@ -1170,7 +1213,7 @@ export function createBot(dependencies: BotDependencies): Bot {
                   typeof call.arguments.reason === "string"
                     ? call.arguments.reason
                     : "Unable to answer from Knowledge Base and Memories";
-                const link = `https://applink.feishu.cn/client/message/link/open?chatId=${encodeURIComponent(message.chatId)}&messageId=${encodeURIComponent(message.messageId)}`;
+                const link = `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(message.chatId)}`;
                 const asker = message.sender.name
                   ? `${message.sender.name} (${message.sender.openId})`
                   : message.sender.openId;
@@ -1180,7 +1223,8 @@ export function createBot(dependencies: BotDependencies): Bot {
                     `Escalation from ${asker}:`,
                     `Question: ${message.text}`,
                     `Reason: ${reason}`,
-                    `Link: ${link}`,
+                    `Chat: ${link}`,
+                    `Message ID: ${message.messageId}`,
                   ].join("\n"),
                 });
                 escalated = true;
@@ -1201,6 +1245,11 @@ export function createBot(dependencies: BotDependencies): Bot {
               }
             }
           }
+          if (!finalText && !escalated) {
+            // Tool rounds exhausted or empty reply: force a plain answer from what was gathered.
+            const response = await llm.chat({ model: settings.chatModel, messages, tools: [] });
+            finalText = response.text?.trim() ?? null;
+          }
         } catch {
           await feishu.replyInTopic({
             chatId: message.chatId,
@@ -1214,7 +1263,7 @@ export function createBot(dependencies: BotDependencies): Bot {
           finalText = "I do not know the answer to that. I have privately notified the Owner.";
         }
         if (!finalText) {
-          return;
+          finalText = NO_ANSWER_REPLY;
         }
 
         const sanitizedText =
@@ -1287,6 +1336,7 @@ export function createBot(dependencies: BotDependencies): Bot {
       }
 
       const transcript = rows
+        .slice(-MAX_EXTRACTION_MESSAGES)
         .map((row) =>
           row.role === "assistant"
             ? `Assistant: ${row.content}`
@@ -1381,11 +1431,20 @@ export function createBot(dependencies: BotDependencies): Bot {
       await handleMessage(event);
     },
     async tick() {
-      const nowMs = clock.now().getTime();
-      expirePendingProposals.run(nowMs, nowMs);
-      await syncRepositories();
-      await processIndexJobs();
-      await runIdleExtractions();
+      // A slow sync or indexing run must not overlap with the next scheduled tick.
+      if (tickRunning) {
+        return;
+      }
+      tickRunning = true;
+      try {
+        const nowMs = clock.now().getTime();
+        expirePendingProposals.run(nowMs, nowMs);
+        await syncRepositories();
+        await processIndexJobs();
+        await runIdleExtractions();
+      } finally {
+        tickRunning = false;
+      }
     },
   };
 }

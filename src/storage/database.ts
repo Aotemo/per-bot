@@ -31,6 +31,7 @@ export function openStorage(path: string): Storage {
     CREATE TABLE IF NOT EXISTS group_members_cache (
       chat_id TEXT NOT NULL,
       open_id TEXT NOT NULL,
+      name TEXT,
       PRIMARY KEY (chat_id, open_id)
     );
 

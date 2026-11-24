@@ -27,13 +27,16 @@ async function git(args: string[], cwd?: string): Promise<string> {
 
 export function createGitRepositorySync(options: GitRepositorySyncOptions): RepositorySyncPort {
   const resolveUrl =
-    options.resolveCloneUrl ??
-    ((repository: string) => {
-      if (options.githubToken) {
-        return `https://x-access-token:${options.githubToken}@github.com/${repository}.git`;
-      }
-      return `https://github.com/${repository}.git`;
-    });
+    options.resolveCloneUrl ?? ((repository: string) => `https://github.com/${repository}.git`);
+  // Passed per command so the token is never written into the clone's .git/config.
+  const authArgs = options.githubToken
+    ? [
+        "-c",
+        `http.https://github.com/.extraheader=AUTHORIZATION: basic ${Buffer.from(
+          `x-access-token:${options.githubToken}`,
+        ).toString("base64")}`,
+      ]
+    : [];
 
   return {
     async sync(repository: string): Promise<RepositorySyncResult> {
@@ -43,9 +46,9 @@ export function createGitRepositorySync(options: GitRepositorySyncOptions): Repo
       const shaMarkerPath = join(options.cloneRoot, `${safeDirName}.last_sha`);
 
       if (!existsSync(join(repoDir, ".git"))) {
-        await git(["clone", "--quiet", resolveUrl(repository), repoDir]);
+        await git([...authArgs, "clone", "--quiet", resolveUrl(repository), repoDir]);
       } else {
-        await git(["pull", "--ff-only", "--quiet"], repoDir);
+        await git([...authArgs, "pull", "--ff-only", "--quiet"], repoDir);
       }
 
       const branch = (await git(["rev-parse", "--abbrev-ref", "HEAD"], repoDir)) || "main";

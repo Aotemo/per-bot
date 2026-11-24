@@ -1,6 +1,6 @@
 import { Client, Domain, EventDispatcher, WSClient } from "@larksuiteoapi/node-sdk";
 import type { InboundCardAction, InboundEvent } from "../domain/inbound";
-import type { FeishuPort, InteractiveCard } from "../ports/feishu";
+import type { FeishuPort, GroupMember, InteractiveCard } from "../ports/feishu";
 
 export type FeishuAdapterOptions = {
   appId: string;
@@ -76,7 +76,7 @@ export function createFeishuAdapter(options: FeishuAdapterOptions): FeishuAdapte
         }
       },
       async listGroupMembers(chatId) {
-        const members: string[] = [];
+        const members: GroupMember[] = [];
         let pageToken: string | undefined;
         do {
           const result = await client.im.chatMembers.get({
@@ -91,7 +91,7 @@ export function createFeishuAdapter(options: FeishuAdapterOptions): FeishuAdapte
           }
           for (const item of result.data?.items ?? []) {
             if (item.member_id) {
-              members.push(item.member_id);
+              members.push({ openId: item.member_id, name: item.name ?? null });
             }
           }
           pageToken = result.data?.has_more ? result.data.page_token : undefined;
@@ -250,7 +250,8 @@ function buildFeishuCardPayload(card: InteractiveCard): Record<string, unknown> 
     }
   }
   return {
-    config: { wide_screen_mode: true },
+    // update_multi is required for im.message.patch to update a sent card.
+    config: { wide_screen_mode: true, update_multi: true },
     header: {
       title: { tag: "plain_text", content: card.title },
     },

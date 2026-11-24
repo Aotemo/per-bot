@@ -12,6 +12,7 @@ const configFileSchema = z.object({
   bot: z.object({
     chatModel: z.string().min(1),
     embeddingModel: z.string().min(1),
+    contextTokens: z.number().int().positive().default(16384),
   }),
   rateLimit: z
     .object({
@@ -55,6 +56,7 @@ export type Config = {
   repositories: string[];
   chatModel: string;
   embeddingModel: string;
+  contextTokens: number;
   rateLimit: RateLimitConfig;
   memory: MemoryConfig;
   databasePath: string;
@@ -83,6 +85,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Config
     repositories: file.repositories,
     chatModel: file.bot.chatModel,
     embeddingModel: file.bot.embeddingModel,
+    contextTokens: file.bot.contextTokens,
     rateLimit: file.rateLimit,
     memory: file.memory,
     databasePath: file.storage.database,

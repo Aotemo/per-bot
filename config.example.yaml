@@ -10,6 +10,8 @@ repositories:
 bot:
   chatModel: qwen3:14b
   embeddingModel: bge-m3
+  # Ollama num_ctx for chat requests
+  contextTokens: 16384
 
 rateLimit:
   maxRequests: 10

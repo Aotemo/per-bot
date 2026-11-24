@@ -21,7 +21,12 @@ type OllamaEmbedResponse = {
 export type OllamaLlmOptions = {
   baseUrl: string;
   embeddingModel: string;
+  /** Context window in tokens; Ollama's default is too small for history plus search results. */
+  contextTokens: number;
 };
+
+const REQUEST_TIMEOUT_MS = 180_000;
+const HEALTH_CHECK_TIMEOUT_MS = 5_000;
 
 /** Talks to the Owner's Ollama instance; there is deliberately no cloud fallback. */
 export function createOllamaLlm(options: OllamaLlmOptions): LlmPort {
@@ -32,6 +37,7 @@ export function createOllamaLlm(options: OllamaLlmOptions): LlmPort {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     if (!response.ok) {
       throw new Error(`Ollama ${path} failed with ${response.status}: ${await response.text()}`);
@@ -53,10 +59,12 @@ export function createOllamaLlm(options: OllamaLlmOptions): LlmPort {
           },
         })),
         stream: false,
+        think: false,
+        options: { num_ctx: options.contextTokens },
       });
 
       const message = response.message;
-      const text = message?.content?.trim();
+      const text = message?.content?.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
 
       return {
         text: text ? text : null,
@@ -74,7 +82,9 @@ export function createOllamaLlm(options: OllamaLlmOptions): LlmPort {
 
     async healthCheck(): Promise<boolean> {
       try {
-        const response = await fetch(`${baseUrl}/api/version`);
+        const response = await fetch(`${baseUrl}/api/version`, {
+          signal: AbortSignal.timeout(HEALTH_CHECK_TIMEOUT_MS),
+        });
         return response.ok;
       } catch {
         return false;

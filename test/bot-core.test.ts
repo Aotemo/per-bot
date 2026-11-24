@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createGitRepositorySync } from "../src/adapters/github-sync";
 import { type BotSettings, createBot } from "../src/bot/core";
 import type { InboundFile, InboundMessage } from "../src/domain/inbound";
+import type { GroupMember } from "../src/ports/feishu";
+import type { RepositorySyncPort } from "../src/ports/repository-sync";
 import { openStorage, type Storage } from "../src/storage/database";
 import {
   createFakeFeishu,
@@ -84,12 +86,10 @@ function groupMessage(overrides: Partial<InboundMessage> = {}): InboundMessage {
 function buildBot(
   script: ScriptedReply[],
   options: {
-    groups?: Record<string, string[]>;
+    groups?: Record<string, Array<string | GroupMember>>;
     settings?: Partial<BotSettings>;
     startTime?: Date;
-    repositorySync?:
-      | ReturnType<typeof createFakeRepositorySync>
-      | ReturnType<typeof createGitRepositorySync>;
+    repositorySync?: RepositorySyncPort;
   } = {},
 ) {
   const storage = createTempStorage();
@@ -264,16 +264,19 @@ describe("bot core — per-topic conversations (#4)", () => {
 
   it("identifies who said each message in a multi-person group topic", async () => {
     const bobId = "ou_bob";
-    const { bot, llm } = buildBot([{ text: "Bob 负责后端，Member 负责前端。" }], {
-      groups: { [ALLOWED_GROUP_ID]: [OWNER_OPEN_ID, MEMBER_OPEN_ID, bobId] },
-    });
+    const { bot, llm } = buildBot(
+      [{ text: "好的，记下了。" }, { text: "Bob 负责后端，Member 负责前端。" }],
+      {
+        groups: { [ALLOWED_GROUP_ID]: [OWNER_OPEN_ID, MEMBER_OPEN_ID, bobId] },
+      },
+    );
 
     await bot.handle(
       groupMessage({
         topicId: "om_multi",
         messageId: "om_m1",
         sender: { openId: bobId, name: "Bob" },
-        mentionsBot: false,
+        mentionsBot: true,
         text: "我负责后端",
       }),
     );
@@ -287,14 +290,53 @@ describe("bot core — per-topic conversations (#4)", () => {
       }),
     );
 
-    expect(llm.requests).toHaveLength(1);
-    const messages = llm.requests[0]?.messages ?? [];
+    expect(llm.requests).toHaveLength(2);
+    const messages = llm.requests[1]?.messages ?? [];
     const userMessages = messages.filter((m) => m.role === "user");
     expect(userMessages).toHaveLength(2);
     expect(userMessages[0]?.content).toContain("Bob");
     expect(userMessages[0]?.content).toContain("我负责后端");
     expect(userMessages[1]?.content).toContain("Member");
     expect(userMessages[1]?.content).toContain("我负责前端");
+  });
+
+  it("does not record group messages that do not @-mention the bot", async () => {
+    const bobId = "ou_bob";
+    const { bot, llm } = buildBot([{ text: "回复" }], {
+      groups: { [ALLOWED_GROUP_ID]: [OWNER_OPEN_ID, MEMBER_OPEN_ID, bobId] },
+    });
+
+    await bot.handle(
+      groupMessage({
+        topicId: "om_silent",
+        messageId: "om_s1",
+        sender: { openId: bobId, name: "Bob" },
+        mentionsBot: false,
+        text: "这句没有 @ bot",
+      }),
+    );
+    await bot.handle(
+      groupMessage({ topicId: "om_silent", messageId: "om_s2", text: "这句 @ 了 bot" }),
+    );
+
+    const userMessages = (llm.requests[0]?.messages ?? []).filter((m) => m.role === "user");
+    expect(userMessages).toHaveLength(1);
+    expect(userMessages[0]?.content).not.toContain("这句没有 @ bot");
+  });
+
+  it("resolves sender display names from group membership", async () => {
+    const { bot, llm } = buildBot([{ text: "回复" }], {
+      groups: {
+        [ALLOWED_GROUP_ID]: [OWNER_OPEN_ID, { openId: MEMBER_OPEN_ID, name: "Alice" }],
+      },
+    });
+
+    await bot.handle(
+      groupMessage({ sender: { openId: MEMBER_OPEN_ID, name: null }, text: "我是谁？" }),
+    );
+
+    const userMessage = llm.requests[0]?.messages.find((m) => m.role === "user");
+    expect(userMessage?.content).toContain("Alice");
   });
 
   it("persists conversations in SQLite across bot restarts", async () => {
@@ -406,6 +448,25 @@ describe("bot core — model availability and rate limiting (#5)", () => {
 
     expect(llm.requests).toHaveLength(3);
     expect(feishu.replies.map((r) => r.text)).toEqual(["答 1", "答 2", "答 3"]);
+  });
+
+  it("forces a plain answer when the model exhausts its tool rounds", async () => {
+    const search = (id: string): ScriptedReply => ({
+      toolCall: { id, name: "search_knowledge_base", arguments: { query: "loop" } },
+    });
+    const { bot, feishu, llm } = buildBot([
+      search("c1"),
+      search("c2"),
+      search("c3"),
+      search("c4"),
+      search("c5"),
+      { text: "根据已有信息的回答。" },
+    ]);
+
+    await bot.handle(privateMessage());
+
+    expect(llm.requests.at(-1)?.tools).toEqual([]);
+    expect(feishu.replies.at(-1)?.text).toBe("根据已有信息的回答。");
   });
 });
 
@@ -529,6 +590,85 @@ describe("bot core — Owner Documents and Knowledge Base retrieval (#6)", () =>
 
     await bot.handle(privateMessage({ messageId: "om_cmd3", text: "/docs" }));
     expect(feishu.replies.at(-1)?.text).not.toContain("guide.md");
+  });
+
+  it("embeds large documents in batches", async () => {
+    const { bot, feishu, llm } = buildBot([]);
+    const lines = Array.from({ length: 40 * 20 }, (_, i) => `line ${i}`).join("\n");
+    feishu.files.set("big", Buffer.from(lines));
+
+    await bot.handle(fileEvent({ fileKey: "big", fileName: "big.txt" }));
+    await bot.tick();
+
+    expect(llm.embedCalls.length).toBeGreaterThan(1);
+    expect(Math.max(...llm.embedCalls.map((batch) => batch.length))).toBeLessThanOrEqual(16);
+  });
+
+  it("fails a document that cannot be embedded without blocking later documents", async () => {
+    const { bot, feishu, llm } = buildBot([
+      { toolCall: { id: "c1", name: "search_knowledge_base", arguments: { query: "good" } } },
+      { text: "找到了。" },
+    ]);
+    llm.failEmbedMarker = "POISON";
+    feishu.files.set("bad", Buffer.from("POISON content"));
+    feishu.files.set("good", Buffer.from("Good content: gamma-7."));
+
+    await bot.handle(fileEvent({ messageId: "om_bad", fileKey: "bad", fileName: "bad.md" }));
+    await bot.handle(fileEvent({ messageId: "om_good", fileKey: "good", fileName: "good.md" }));
+    await bot.tick();
+
+    await bot.handle(privateMessage({ messageId: "om_docs", text: "/docs" }));
+    const docs = feishu.replies.at(-1)?.text ?? "";
+    expect(docs).toContain("bad.md (failed)");
+    expect(docs).toContain("good.md (indexed)");
+
+    await bot.handle(privateMessage({ messageId: "om_q", text: "查一下" }));
+    const toolMessage = llm.requests[0]?.messages.find((m) => m.role === "tool");
+    expect(toolMessage?.content).toContain("gamma-7");
+  });
+
+  it("does not run overlapping ticks", async () => {
+    let syncCalls = 0;
+    let releaseSync: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      releaseSync = resolve;
+    });
+    const slowSync: RepositorySyncPort = {
+      async sync() {
+        syncCalls += 1;
+        await gate;
+        return { branch: "main", changedFiles: [], deletedFiles: [] };
+      },
+    };
+    const { bot } = buildBot([], {
+      settings: { repositories: ["Aotemo/demo-repo"] },
+      repositorySync: slowSync,
+    });
+
+    const first = bot.tick();
+    await bot.tick();
+    releaseSync();
+    await first;
+
+    expect(syncCalls).toBe(1);
+  });
+
+  it("does not list a non-Owner User's Supplementary Documents in a group", async () => {
+    const { bot, feishu } = buildBot([]);
+    feishu.files.set("m", Buffer.from("Member doc"));
+    await bot.handle(
+      fileEvent({
+        chatId: "oc_member_private",
+        sender: { openId: MEMBER_OPEN_ID, name: "Member" },
+        fileKey: "m",
+        fileName: "private-plan.md",
+      }),
+    );
+
+    await bot.handle(groupMessage({ messageId: "om_g_docs", text: "/docs" }));
+
+    expect(feishu.replies.at(-1)?.text).not.toContain("private-plan.md");
+    expect(feishu.replies.at(-1)?.text.toLowerCase()).toContain("private chat");
   });
 });
 
@@ -1188,7 +1328,9 @@ describe("bot core — Idle extraction of Memories (#13)", () => {
     const bobId = "ou_bob";
     const { bot, feishu, llm, clock } = buildBot(
       [
-        // 1. Reply to Member's message
+        // 1. Reply to Bob's message
+        { text: "好的。" },
+        // 1b. Reply to Member's message
         { text: "收到，了解了。" },
         // 2. Idle extraction LLM output: 1 update for Member, 1 add for Bob, 1 invalid speaker attribution (should be dropped)
         {
@@ -1242,7 +1384,7 @@ describe("bot core — Idle extraction of Memories (#13)", () => {
         topicId: "om_idle_topic",
         messageId: "om_i1",
         sender: { openId: bobId, name: "Bob" },
-        mentionsBot: false,
+        mentionsBot: true,
         text: "我负责维护 CI 流水线",
       }),
     );
@@ -1275,7 +1417,7 @@ describe("bot core — Idle extraction of Memories (#13)", () => {
     await bot.tick();
 
     expect(feishu.cards).toHaveLength(2);
-    const extractionReq = llm.requests[1];
+    const extractionReq = llm.requests[2];
     const extractionPrompt = extractionReq?.messages.map((m) => m.content).join("\n") ?? "";
     expect(extractionPrompt).toContain("Uses Java for backend services");
     expect(extractionPrompt.toLowerCase()).toContain("sensitive");
@@ -1308,7 +1450,7 @@ describe("bot core — Idle extraction of Memories (#13)", () => {
         text: "我用什么写后端？",
       }),
     );
-    const sysAfter = llm.requests[2]?.messages.find((m) => m.role === "system")?.content ?? "";
+    const sysAfter = llm.requests[3]?.messages.find((m) => m.role === "system")?.content ?? "";
     expect(sysAfter).toContain("Uses Go for backend services");
     expect(sysAfter).not.toContain("Uses Java for backend services");
   });

@@ -29,11 +29,16 @@ export type InteractiveCard = {
   items: CardItem[];
 };
 
+export type GroupMember = {
+  openId: string;
+  name: string | null;
+};
+
 export type FeishuPort = {
   replyInTopic(reply: ReplyInTopic): Promise<void>;
   sendPrivateMessage(message: PrivateMessage): Promise<void>;
   sendCard(card: InteractiveCard): Promise<string>;
   updateCard(cardId: string, card: InteractiveCard): Promise<void>;
-  listGroupMembers(chatId: string): Promise<string[]>;
+  listGroupMembers(chatId: string): Promise<GroupMember[]>;
   downloadFile(messageId: string, fileKey: string): Promise<Buffer>;
 };
