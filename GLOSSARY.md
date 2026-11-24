@@ -21,7 +21,7 @@ Anyone permitted to talk to the bot: the Owner, or any member of an Allowed Grou
 _Avoid_: Account, member, asker
 
 **Allowed Group**:
-A Feishu group the Owner has authorized; every member of it is a User.
+Any Feishu group the bot has been added to; every member of it is a User. Adding the bot to a group is the act of authorizing it.
 _Avoid_: Whitelisted chat, workspace
 
 **Knowledge Base**:

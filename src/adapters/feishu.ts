@@ -98,6 +98,25 @@ export function createFeishuAdapter(options: FeishuAdapterOptions): FeishuAdapte
         } while (pageToken);
         return members;
       },
+      async listBotGroups() {
+        const chatIds: string[] = [];
+        let pageToken: string | undefined;
+        do {
+          const result = await client.im.chat.list({
+            params: { page_size: 100, ...(pageToken ? { page_token: pageToken } : {}) },
+          });
+          if (result.code !== 0) {
+            throw new Error(`Feishu listBotGroups failed with ${result.code}: ${result.msg}`);
+          }
+          for (const item of result.data?.items ?? []) {
+            if (item.chat_id) {
+              chatIds.push(item.chat_id);
+            }
+          }
+          pageToken = result.data?.has_more ? result.data.page_token : undefined;
+        } while (pageToken);
+        return chatIds;
+      },
       async downloadFile(messageId, fileKey) {
         const response = await client.im.messageResource.get({
           path: { message_id: messageId, file_key: fileKey },

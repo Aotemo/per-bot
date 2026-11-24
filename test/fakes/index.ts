@@ -75,6 +75,9 @@ export function createFakeFeishu(
       groupMemberLookups.push(chatId);
       return groupMembers.get(chatId) ?? [];
     },
+    async listBotGroups() {
+      return [...groupMembers.keys()];
+    },
     async downloadFile(_messageId, fileKey) {
       const content = files.get(fileKey);
       if (!content) {

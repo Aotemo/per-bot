@@ -1,8 +1,7 @@
 owner:
   openId: ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
-allowedGroups:
-  - oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# Every group the bot is added to is an Allowed Group; no group list is configured.
 
 repositories:
   - owner/private-repo

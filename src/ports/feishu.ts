@@ -40,5 +40,7 @@ export type FeishuPort = {
   sendCard(card: InteractiveCard): Promise<string>;
   updateCard(cardId: string, card: InteractiveCard): Promise<void>;
   listGroupMembers(chatId: string): Promise<GroupMember[]>;
+  /** Chat ids of every group the bot has been added to. */
+  listBotGroups(): Promise<string[]>;
   downloadFile(messageId: string, fileKey: string): Promise<Buffer>;
 };

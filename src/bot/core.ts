@@ -30,7 +30,6 @@ export type MemorySettings = {
 export type BotSettings = {
   ownerOpenId: string;
   chatModel: string;
-  allowedGroups: string[];
   repositories?: string[];
   syncIntervalMs?: number;
   rateLimit?: RateLimitSettings;
@@ -143,7 +142,6 @@ type SearchHit = {
 export function createBot(dependencies: BotDependencies): Bot {
   const { settings, storage, feishu, llm, repositorySync, clock } = dependencies;
   const { db } = storage;
-  const allowedGroupSet = new Set(settings.allowedGroups);
   const repositories = settings.repositories ?? [];
   const syncIntervalMs = settings.syncIntervalMs ?? DEFAULT_SYNC_INTERVAL_MS;
   const rateLimit = settings.rateLimit ?? DEFAULT_RATE_LIMIT;
@@ -153,6 +151,7 @@ export function createBot(dependencies: BotDependencies): Bot {
   let queueDepth = 0;
   let queueTail: Promise<void> = Promise.resolve();
   let tickRunning = false;
+  let botGroupsCache: { chatIds: string[]; fetchedAt: number } | null = null;
 
   const countRateLimitEvents = db.prepare<[string, number], { count: number }>(
     "SELECT COUNT(*) AS count FROM rate_limit_events WHERE open_id = ? AND created_at > ?",
@@ -582,11 +581,22 @@ export function createBot(dependencies: BotDependencies): Bot {
     saveGroupMembers(chatId, members, nowMs);
   }
 
+  async function listAllowedGroups(): Promise<string[]> {
+    const nowMs = clock.now().getTime();
+    if (botGroupsCache && nowMs - botGroupsCache.fetchedAt < GROUP_CACHE_TTL_MS) {
+      return botGroupsCache.chatIds;
+    }
+    const chatIds = await feishu.listBotGroups();
+    botGroupsCache = { chatIds, fetchedAt: nowMs };
+    return chatIds;
+  }
+
+  /** Private-chat authorization: the Owner, or a member of any group the bot is in. */
   async function isAuthorizedUser(openId: string): Promise<boolean> {
     if (openId === settings.ownerOpenId) {
       return true;
     }
-    for (const groupId of settings.allowedGroups) {
+    for (const groupId of await listAllowedGroups()) {
       await ensureGroupCached(groupId);
       if (selectGroupMember.get(groupId, openId)) {
         return true;
@@ -907,21 +917,18 @@ export function createBot(dependencies: BotDependencies): Bot {
 
   async function handleFile(inbound: InboundFile): Promise<void> {
     const topicId = inbound.topicId ?? inbound.messageId;
-    if (inbound.chatType === "group" && !allowedGroupSet.has(inbound.chatId)) {
+    if (inbound.chatType === "group") {
+      // Every group the bot is in is an Allowed Group, so any group sender is a User.
+      await ensureGroupCached(inbound.chatId);
+    } else if (!(await isAuthorizedUser(inbound.sender.openId))) {
+      await feishu.replyInTopic({
+        chatId: inbound.chatId,
+        topicId,
+        text: NO_PERMISSION_REPLY,
+      });
       return;
     }
-    const isUser = await isAuthorizedUser(inbound.sender.openId);
     const event: InboundFile = { ...inbound, sender: resolveSender(inbound.sender) };
-    if (!isUser) {
-      if (event.chatType === "private") {
-        await feishu.replyInTopic({
-          chatId: event.chatId,
-          topicId,
-          text: NO_PERMISSION_REPLY,
-        });
-      }
-      return;
-    }
 
     if (!isSupportedFileName(event.fileName)) {
       await feishu.replyInTopic({
@@ -1068,15 +1075,10 @@ export function createBot(dependencies: BotDependencies): Bot {
   async function handleMessage(inbound: InboundMessage): Promise<void> {
     const topicId = inbound.topicId ?? inbound.messageId;
 
-    // In groups the bot only takes part when @-mentioned in an Allowed Group; other messages
-    // are neither answered nor recorded, so they never reach context or Memory extraction.
-    if (
-      inbound.chatType === "group" &&
-      (!inbound.mentionsBot || !allowedGroupSet.has(inbound.chatId))
-    ) {
-      return;
-    }
-    if (!(await isAuthorizedUser(inbound.sender.openId))) {
+    if (inbound.chatType === "group") {
+      // Every group the bot is in is an Allowed Group, so any group sender is a User.
+      await ensureGroupCached(inbound.chatId);
+    } else if (!(await isAuthorizedUser(inbound.sender.openId))) {
       await feishu.replyInTopic({
         chatId: inbound.chatId,
         topicId,
@@ -1085,6 +1087,16 @@ export function createBot(dependencies: BotDependencies): Bot {
       return;
     }
     const message: InboundMessage = { ...inbound, sender: resolveSender(inbound.sender) };
+
+    if (message.chatType === "group" && !message.mentionsBot) {
+      // Recorded for topic context and Memory extraction, but only answered when @-mentioned.
+      recordMessage(topicId, message.chatId, message.chatType, "user", message.text, {
+        messageId: message.messageId,
+        senderOpenId: message.sender.openId,
+        senderName: message.sender.name,
+      });
+      return;
+    }
 
     const trimmed = message.text.trim();
     if (trimmed === "/docs" || trimmed.startsWith("/docs ")) {

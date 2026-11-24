@@ -50,7 +50,6 @@ function defaultSettings(overrides: Partial<BotSettings> = {}): BotSettings {
   return {
     ownerOpenId: OWNER_OPEN_ID,
     chatModel: "qwen3:14b",
-    allowedGroups: [ALLOWED_GROUP_ID],
     ...overrides,
   };
 }
@@ -189,34 +188,29 @@ describe("bot core — authorization and @-only triggering (#3)", () => {
     expect(llm.requests).toHaveLength(0);
   });
 
-  it("replies with no permission when a non-User @-mentions the bot in a group", async () => {
-    const { bot, feishu, llm } = buildBot([{ text: "不该调用模型" }]);
-
-    await bot.handle(
-      groupMessage({
-        sender: { openId: OUTSIDER_OPEN_ID, name: "Outsider" },
-        mentionsBot: true,
-      }),
-    );
-
-    expect(feishu.replies).toHaveLength(1);
-    expect(feishu.replies[0]?.text.toLowerCase()).toContain("permission");
-    expect(llm.requests).toHaveLength(0);
-  });
-
-  it("does not answer messages in groups that are not Allowed Groups", async () => {
-    const { bot, feishu, llm } = buildBot([{ text: "不该回答" }]);
+  it("treats every group the bot is in as an Allowed Group without configuration", async () => {
+    const { bot, feishu } = buildBot([{ text: "新群里的回答。" }, { text: "私聊回答。" }], {
+      groups: {
+        [ALLOWED_GROUP_ID]: [OWNER_OPEN_ID, MEMBER_OPEN_ID],
+        [OTHER_GROUP_ID]: [OUTSIDER_OPEN_ID],
+      },
+    });
 
     await bot.handle(
       groupMessage({
         chatId: OTHER_GROUP_ID,
-        sender: { openId: OWNER_OPEN_ID, name: "Owner" },
-        mentionsBot: true,
+        sender: { openId: OUTSIDER_OPEN_ID, name: "Newcomer" },
+      }),
+    );
+    await bot.handle(
+      privateMessage({
+        chatId: "oc_newcomer_private",
+        messageId: "om_newcomer",
+        sender: { openId: OUTSIDER_OPEN_ID, name: "Newcomer" },
       }),
     );
 
-    expect(feishu.replies).toEqual([]);
-    expect(llm.requests).toHaveLength(0);
+    expect(feishu.replies.map((r) => r.text)).toEqual(["新群里的回答。", "私聊回答。"]);
   });
 
   it("caches group membership lookups via FeishuPort", async () => {
@@ -300,7 +294,7 @@ describe("bot core — per-topic conversations (#4)", () => {
     expect(userMessages[1]?.content).toContain("我负责前端");
   });
 
-  it("does not record group messages that do not @-mention the bot", async () => {
+  it("records group messages that do not @-mention the bot as topic context", async () => {
     const bobId = "ou_bob";
     const { bot, llm } = buildBot([{ text: "回复" }], {
       groups: { [ALLOWED_GROUP_ID]: [OWNER_OPEN_ID, MEMBER_OPEN_ID, bobId] },
@@ -319,9 +313,11 @@ describe("bot core — per-topic conversations (#4)", () => {
       groupMessage({ topicId: "om_silent", messageId: "om_s2", text: "这句 @ 了 bot" }),
     );
 
+    expect(llm.requests).toHaveLength(1);
     const userMessages = (llm.requests[0]?.messages ?? []).filter((m) => m.role === "user");
-    expect(userMessages).toHaveLength(1);
-    expect(userMessages[0]?.content).not.toContain("这句没有 @ bot");
+    expect(userMessages).toHaveLength(2);
+    expect(userMessages[0]?.content).toContain("Bob");
+    expect(userMessages[0]?.content).toContain("这句没有 @ bot");
   });
 
   it("resolves sender display names from group membership", async () => {
@@ -1328,9 +1324,7 @@ describe("bot core — Idle extraction of Memories (#13)", () => {
     const bobId = "ou_bob";
     const { bot, feishu, llm, clock } = buildBot(
       [
-        // 1. Reply to Bob's message
-        { text: "好的。" },
-        // 1b. Reply to Member's message
+        // 1. Reply to Member's message
         { text: "收到，了解了。" },
         // 2. Idle extraction LLM output: 1 update for Member, 1 add for Bob, 1 invalid speaker attribution (should be dropped)
         {
@@ -1384,7 +1378,8 @@ describe("bot core — Idle extraction of Memories (#13)", () => {
         topicId: "om_idle_topic",
         messageId: "om_i1",
         sender: { openId: bobId, name: "Bob" },
-        mentionsBot: true,
+        // Not addressed to the bot, but still part of the topic and extracted.
+        mentionsBot: false,
         text: "我负责维护 CI 流水线",
       }),
     );
@@ -1417,9 +1412,10 @@ describe("bot core — Idle extraction of Memories (#13)", () => {
     await bot.tick();
 
     expect(feishu.cards).toHaveLength(2);
-    const extractionReq = llm.requests[2];
+    const extractionReq = llm.requests[1];
     const extractionPrompt = extractionReq?.messages.map((m) => m.content).join("\n") ?? "";
     expect(extractionPrompt).toContain("Uses Java for backend services");
+    expect(extractionPrompt).toContain("我负责维护 CI 流水线");
     expect(extractionPrompt.toLowerCase()).toContain("sensitive");
 
     const batchCard = feishu.cards[1];
@@ -1450,7 +1446,7 @@ describe("bot core — Idle extraction of Memories (#13)", () => {
         text: "我用什么写后端？",
       }),
     );
-    const sysAfter = llm.requests[3]?.messages.find((m) => m.role === "system")?.content ?? "";
+    const sysAfter = llm.requests[2]?.messages.find((m) => m.role === "system")?.content ?? "";
     expect(sysAfter).toContain("Uses Go for backend services");
     expect(sysAfter).not.toContain("Uses Java for backend services");
   });

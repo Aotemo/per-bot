@@ -31,7 +31,6 @@ async function main(): Promise<void> {
   const bot = createBot({
     settings: {
       ownerOpenId: config.ownerOpenId,
-      allowedGroups: config.allowedGroups,
       repositories: config.repositories,
       chatModel: config.chatModel,
       rateLimit: config.rateLimit,

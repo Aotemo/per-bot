@@ -7,7 +7,6 @@ const configFileSchema = z.object({
   owner: z.object({
     openId: z.string().min(1),
   }),
-  allowedGroups: z.array(z.string().min(1)).default([]),
   repositories: z.array(z.string().min(1)).default([]),
   bot: z.object({
     chatModel: z.string().min(1),
@@ -52,7 +51,6 @@ export type MemoryConfig = {
 
 export type Config = {
   ownerOpenId: string;
-  allowedGroups: string[];
   repositories: string[];
   chatModel: string;
   embeddingModel: string;
@@ -81,7 +79,6 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Config
 
   return {
     ownerOpenId: file.owner.openId,
-    allowedGroups: file.allowedGroups,
     repositories: file.repositories,
     chatModel: file.bot.chatModel,
     embeddingModel: file.bot.embeddingModel,
