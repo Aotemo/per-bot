@@ -1,10 +1,16 @@
 // Smoke test against a live Ollama through the real adapter.
-// Usage: OLLAMA_URL=http://127.0.0.1:11434 npx tsx scripts/colab/smoke.ts
+// Usage: OLLAMA_URL=http://127.0.0.1:11434 [OLLAMA_API_KEY=...] npx tsx scripts/colab/smoke.ts
 import { createOllamaLlm } from "../../src/adapters/ollama";
 
 const baseUrl = process.env.OLLAMA_URL ?? "http://127.0.0.1:11434";
-const chatModel = process.env.CHAT_MODEL ?? "qwen3:14b";
-const llm = createOllamaLlm({ baseUrl, embeddingModel: "bge-m3", contextTokens: 32768 });
+const chatModel = process.env.CHAT_MODEL ?? "qwen3.6:35b-a3b";
+const apiKey = process.env.OLLAMA_API_KEY;
+const llm = createOllamaLlm({
+  baseUrl,
+  embeddingModel: "bge-m3",
+  contextTokens: 32768,
+  ...(apiKey ? { apiKey } : {}),
+});
 
 async function timed<T>(label: string, run: () => Promise<T>): Promise<T> {
   const start = performance.now();

@@ -55,6 +55,7 @@ const environmentSchema = z.object({
   FEISHU_DOMAIN: z.enum(["feishu", "lark"]).default("feishu"),
   FEISHU_BOT_OPEN_ID: z.string().optional(),
   OLLAMA_URL: z.string().url(),
+  OLLAMA_API_KEY: z.string().optional(),
   GITHUB_TOKEN: z.string().optional(),
 });
 
@@ -85,6 +86,7 @@ export type Config = {
   };
   ollama: {
     url: string;
+    apiKey: string | undefined;
   };
   github: {
     token: string | undefined;
@@ -113,6 +115,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Config
     },
     ollama: {
       url: env.OLLAMA_URL,
+      apiKey: env.OLLAMA_API_KEY || undefined,
     },
     github: {
       token: env.GITHUB_TOKEN,

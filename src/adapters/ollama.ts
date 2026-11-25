@@ -23,6 +23,8 @@ export type OllamaLlmOptions = {
   embeddingModel: string;
   /** Context window in tokens; Ollama's default is too small for history plus search results. */
   contextTokens: number;
+  /** Bearer token for an Ollama exposed through an authenticating proxy (e.g. on Kaggle). */
+  apiKey?: string;
 };
 
 const REQUEST_TIMEOUT_MS = 180_000;
@@ -31,11 +33,14 @@ const HEALTH_CHECK_TIMEOUT_MS = 5_000;
 /** Talks to the Owner's Ollama instance; there is deliberately no cloud fallback. */
 export function createOllamaLlm(options: OllamaLlmOptions): LlmPort {
   const baseUrl = options.baseUrl.replace(/\/$/, "");
+  const authHeaders: Record<string, string> = options.apiKey
+    ? { authorization: `Bearer ${options.apiKey}` }
+    : {};
 
   async function post<T>(path: string, body: unknown): Promise<T> {
     const response = await fetch(`${baseUrl}${path}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...authHeaders },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
@@ -83,6 +88,7 @@ export function createOllamaLlm(options: OllamaLlmOptions): LlmPort {
     async healthCheck(): Promise<boolean> {
       try {
         const response = await fetch(`${baseUrl}/api/version`, {
+          headers: authHeaders,
           signal: AbortSignal.timeout(HEALTH_CHECK_TIMEOUT_MS),
         });
         return response.ok;

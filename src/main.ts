@@ -22,6 +22,7 @@ async function main(): Promise<void> {
     baseUrl: config.ollama.url,
     embeddingModel: config.embeddingModel,
     contextTokens: config.contextTokens,
+    ...(config.ollama.apiKey ? { apiKey: config.ollama.apiKey } : {}),
   });
 
   const feishu = createFeishuAdapter(config.feishu);
