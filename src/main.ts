@@ -12,6 +12,8 @@ import { createBot } from "./bot/core";
 import { loadConfig } from "./config";
 import { openStorage } from "./storage/database";
 
+const MAX_SEEN_EVENT_IDS = 1000;
+
 async function main(): Promise<void> {
   const config = loadConfig();
   const storage = openStorage(config.databasePath);
@@ -45,28 +47,51 @@ async function main(): Promise<void> {
     },
   });
 
+  // Feishu redelivers an event that is not acknowledged within 3 seconds, and the SDK only
+  // acknowledges once the handler returns. Handlers therefore return immediately and the bot
+  // works in the background; event ids catch any redelivery that still happens.
+  const seenEventIds = new Set<string>();
+  const isRedelivery = (eventId: string | undefined): boolean => {
+    if (!eventId) {
+      return false;
+    }
+    if (seenEventIds.has(eventId)) {
+      return true;
+    }
+    seenEventIds.add(eventId);
+    if (seenEventIds.size > MAX_SEEN_EVENT_IDS) {
+      const oldest = seenEventIds.values().next().value;
+      if (oldest !== undefined) {
+        seenEventIds.delete(oldest);
+      }
+    }
+    return false;
+  };
+
   feishu.dispatcher.register({
-    "im.message.receive_v1": async (event) => {
+    "im.message.receive_v1": (event) => {
+      if (isRedelivery(event.event_id)) {
+        return;
+      }
       const message = normalizeMessageEvent(event, config.feishu.botOpenId);
       if (!message) {
         return;
       }
-      try {
-        await bot.handle(message);
-      } catch (error) {
+      bot.handle(message).catch((error) => {
         console.error("failed to handle message", error);
-      }
+      });
     },
-    "card.action.trigger": async (event: RawCardActionEvent) => {
+    "card.action.trigger": (event: RawCardActionEvent & { event_id?: string }) => {
+      if (isRedelivery(event.event_id)) {
+        return;
+      }
       const action = normalizeCardActionEvent(event);
       if (!action) {
         return;
       }
-      try {
-        await bot.handle(action);
-      } catch (error) {
+      bot.handle(action).catch((error) => {
         console.error("failed to handle card action", error);
-      }
+      });
     },
   });
 
