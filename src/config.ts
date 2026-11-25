@@ -3,15 +3,34 @@ import { resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 
+const GITHUB_REPOSITORY =
+  /^(?:(?:https?:\/\/)?github\.com\/)?([A-Za-z0-9-]+\/[A-Za-z0-9._-]+?)(?:\.git)?\/?$/;
+
+/** A GitHub repository as `owner/repo`; full github.com URLs are normalized to that form. */
+const repositorySchema = z
+  .string()
+  .trim()
+  .transform((value, ctx) => {
+    const match = GITHUB_REPOSITORY.exec(value);
+    if (!match?.[1]) {
+      ctx.addIssue({
+        code: "custom",
+        message: `Invalid repository "${value}": expected a GitHub owner/repo such as Aotemo/per-bot`,
+      });
+      return z.NEVER;
+    }
+    return match[1];
+  });
+
 const configFileSchema = z.object({
   owner: z.object({
     openId: z.string().min(1),
   }),
-  repositories: z.array(z.string().min(1)).default([]),
+  repositories: z.array(repositorySchema).default([]),
   bot: z.object({
     chatModel: z.string().min(1),
     embeddingModel: z.string().min(1),
-    contextTokens: z.number().int().positive().default(16384),
+    contextTokens: z.number().int().positive().default(32768),
   }),
   rateLimit: z
     .object({
