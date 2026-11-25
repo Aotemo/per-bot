@@ -7,10 +7,19 @@ repositories:
   - owner/private-repo
 
 bot:
+  # Chat model provider: "ollama" (default) or "codebuddy-cli"
+  chatProvider: ollama
+  # For ollama: e.g. qwen3.6:35b-a3b
+  # For codebuddy-cli: any model supported by `codebuddy --model` (e.g. hy4flash-free, deepseek-v4.1-flash, glm-5.3)
   chatModel: qwen3.6:35b-a3b
   embeddingModel: bge-m3
   # Ollama num_ctx for chat requests
   contextTokens: 32768
+  # Optional settings when chatProvider is "codebuddy-cli"
+  # codebuddy:
+  #   command: codebuddy
+  #   extraArgs: []
+  #   timeoutMs: 180000
 
 rateLimit:
   maxRequests: 10

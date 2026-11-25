@@ -384,13 +384,11 @@ describe("bot core — model availability and rate limiting (#5)", () => {
     const releaseFirst = llm.pauseNextChat();
 
     const p1 = bot.handle(privateMessage({ messageId: "om_1", text: "问题 1" }));
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
 
     const p2 = bot.handle(privateMessage({ messageId: "om_2", text: "问题 2" }));
     const p3 = bot.handle(privateMessage({ messageId: "om_3", text: "问题 3" }));
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
 
     // Queued requests receive immediate "thinking" acknowledgements before first finishes
     expect(
@@ -499,6 +497,11 @@ describe("bot core — Owner Documents and Knowledge Base retrieval (#6)", () =>
 
     await bot.tick();
     expect(llm.embedCalls.length).toBeGreaterThan(0);
+    expect(feishu.replies.at(-1)).toMatchObject({
+      chatId: "oc_private",
+      topicId: "om_file_1",
+      text: "Indexed deploy.md (1 chunk).",
+    });
 
     await bot.handle(privateMessage({ messageId: "om_q1", text: "部署端口是多少？" }));
 
@@ -562,6 +565,11 @@ describe("bot core — Owner Documents and Knowledge Base retrieval (#6)", () =>
     llm.setOffline(false);
     await bot.tick();
     expect(llm.embedCalls.length).toBeGreaterThan(0);
+    expect(feishu.replies.at(-1)).toMatchObject({
+      chatId: "oc_private",
+      topicId: "om_file_1",
+      text: "Indexed arch.pdf (1 chunk).",
+    });
   });
 
   it("does not trigger Knowledge Base search on casual messages", async () => {
@@ -1490,5 +1498,42 @@ describe("bot core — Idle extraction of Memories (#13)", () => {
     const sysAfter = llm.requests[2]?.messages.find((m) => m.role === "system")?.content ?? "";
     expect(sysAfter).toContain("Uses Go for backend services");
     expect(sysAfter).not.toContain("Uses Java for backend services");
+  });
+
+  it("compacts older turns into a rolling summary once a topic exceeds the history window", async () => {
+    // 10 turns = 20 messages (no compaction). Turn 11 adds message #21 -> triggers 1 summary call + 1 reply call.
+    const responses = [
+      ...Array.from({ length: 10 }, (_, i) => ({ text: `回复 ${i + 1}` })),
+      { text: "Earlier turns discussed project setup and ports." },
+      { text: "回复 11" },
+    ];
+    const { bot, llm } = buildBot(responses);
+
+    for (let i = 1; i <= 11; i += 1) {
+      await bot.handle(
+        privateMessage({
+          topicId: "om_long_topic",
+          messageId: `om_turn_${i}`,
+          text: `问题 ${i}`,
+        }),
+      );
+    }
+
+    // 10 normal replies + 1 summary call + 1 final reply = 12 LLM requests
+    expect(llm.requests).toHaveLength(12);
+    const summaryRequest = llm.requests[10];
+    expect(summaryRequest?.tools).toEqual([]);
+    expect(summaryRequest?.messages[1]?.content).toContain("问题 1");
+
+    const finalRequest = llm.requests[11];
+    const systemContent = finalRequest?.messages.find((m) => m.role === "system")?.content ?? "";
+    expect(systemContent).toContain("Earlier conversation summary:");
+    expect(systemContent).toContain("Earlier turns discussed project setup and ports.");
+
+    const historyMessages = finalRequest?.messages.filter((m) => m.role !== "system") ?? [];
+    // Keeps 12 recent messages verbatim (after compacting the first 9 of 21 messages)
+    expect(historyMessages).toHaveLength(12);
+    expect(historyMessages.some((m) => m.content.endsWith("问题 1"))).toBe(false);
+    expect(historyMessages.at(-1)?.content).toContain("问题 11");
   });
 });

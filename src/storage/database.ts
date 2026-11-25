@@ -41,7 +41,9 @@ export function openStorage(path: string): Storage {
       chat_type TEXT NOT NULL,
       created_at INTEGER NOT NULL,
       last_message_at INTEGER NOT NULL,
-      last_extracted_at INTEGER
+      last_extracted_at INTEGER,
+      summary TEXT,
+      summary_until_message_id INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS conversation_messages (
@@ -105,7 +107,9 @@ export function openStorage(path: string): Storage {
       document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
       status TEXT NOT NULL DEFAULT 'pending',
       created_at INTEGER NOT NULL,
-      completed_at INTEGER
+      completed_at INTEGER,
+      notify_chat_id TEXT,
+      notify_topic_id TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_index_jobs_status
@@ -138,6 +142,30 @@ export function openStorage(path: string): Storage {
     CREATE INDEX IF NOT EXISTS idx_memory_proposals_status
       ON memory_proposals(status, expires_at);
   `);
+
+  const conversationColumns = new Set(
+    (db.prepare("PRAGMA table_info(conversations)").all() as Array<{ name: string }>).map(
+      (column) => column.name,
+    ),
+  );
+  if (!conversationColumns.has("summary")) {
+    db.exec("ALTER TABLE conversations ADD COLUMN summary TEXT");
+  }
+  if (!conversationColumns.has("summary_until_message_id")) {
+    db.exec("ALTER TABLE conversations ADD COLUMN summary_until_message_id INTEGER");
+  }
+
+  const indexJobColumns = new Set(
+    (db.prepare("PRAGMA table_info(index_jobs)").all() as Array<{ name: string }>).map(
+      (column) => column.name,
+    ),
+  );
+  if (!indexJobColumns.has("notify_chat_id")) {
+    db.exec("ALTER TABLE index_jobs ADD COLUMN notify_chat_id TEXT");
+  }
+  if (!indexJobColumns.has("notify_topic_id")) {
+    db.exec("ALTER TABLE index_jobs ADD COLUMN notify_topic_id TEXT");
+  }
 
   return {
     db,

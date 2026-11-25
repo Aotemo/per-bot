@@ -6,7 +6,7 @@
 set -euo pipefail
 
 SESSION=${SESSION:-ollama}
-GPU=${GPU:-T4}
+GPU=${GPU:-L4}
 LOCAL_PORT=${LOCAL_PORT:-11434}
 # Colab only accepts ed25519/ecdsa keys
 SSH_KEY=${SSH_KEY:-$HOME/.ssh/id_ed25519_colab}

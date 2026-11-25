@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { dirname, join } from "node:path";
+import { createCodeBuddyCliLlm } from "./adapters/codebuddy-cli";
 import {
   createFeishuAdapter,
   normalizeCardActionEvent,
@@ -10,6 +11,7 @@ import { createGitRepositorySync } from "./adapters/github-sync";
 import { createOllamaLlm } from "./adapters/ollama";
 import { createBot } from "./bot/core";
 import { loadConfig } from "./config";
+import type { LlmPort } from "./ports/llm";
 import { openStorage } from "./storage/database";
 
 const MAX_SEEN_EVENT_IDS = 1000;
@@ -18,12 +20,27 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const storage = openStorage(config.databasePath);
 
-  const llm = createOllamaLlm({
-    baseUrl: config.ollama.url,
-    embeddingModel: config.embeddingModel,
-    contextTokens: config.contextTokens,
-    ...(config.ollama.apiKey ? { apiKey: config.ollama.apiKey } : {}),
-  });
+  const ollamaLlm = config.ollama.url
+    ? createOllamaLlm({
+        baseUrl: config.ollama.url,
+        embeddingModel: config.embeddingModel,
+        contextTokens: config.contextTokens,
+        ...(config.ollama.apiKey ? { apiKey: config.ollama.apiKey } : {}),
+      })
+    : undefined;
+
+  let llm: LlmPort;
+  if (config.chatProvider === "codebuddy-cli") {
+    llm = createCodeBuddyCliLlm({
+      ...config.codebuddy,
+      ...(ollamaLlm ? { embedProvider: ollamaLlm } : {}),
+    });
+  } else {
+    if (!ollamaLlm) {
+      throw new Error('OLLAMA_URL is required when bot.chatProvider is "ollama"');
+    }
+    llm = ollamaLlm;
+  }
 
   const feishu = createFeishuAdapter(config.feishu);
   const repositorySync = createGitRepositorySync({

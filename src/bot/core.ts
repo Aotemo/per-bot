@@ -56,6 +56,7 @@ const DEFAULT_RATE_LIMIT: RateLimitSettings = { maxRequests: 10, windowSeconds: 
 const DEFAULT_MEMORY_SETTINGS: MemorySettings = { proposalTtlDays: 7, extractionIdleMinutes: 30 };
 const MAX_TOOL_ROUNDS = 5;
 const MAX_HISTORY_MESSAGES = 20;
+const RECENT_MESSAGES_TO_KEEP = 12;
 const MAX_EXTRACTION_MESSAGES = 60;
 const EMBED_BATCH_SIZE = 16;
 const NO_PERMISSION_REPLY = "Sorry, you do not have permission to use this bot.";
@@ -85,6 +86,13 @@ const EXTRACTION_SYSTEM_PROMPT = [
   "2. All Memories are public: NEVER extract sensitive personal information (family, health, credentials, passwords, financial details, addresses, etc.).",
   "3. Compare against each speaker's existing Memories. If a new fact updates or conflicts with an existing Memory, output op='update' with that memoryId; otherwise output op='add'.",
   '4. Respond with JSON only: {"proposals": [{"speakerOpenId": "...", "op": "add"|"update", "memoryId": number|null, "fact": "..."}]}.',
+].join("\n");
+
+const SUMMARY_SYSTEM_PROMPT = [
+  "You summarize earlier turns of a conversation so the assistant keeps context after older messages are compacted.",
+  "Preserve key facts, decisions, questions, document/repository references, and unresolved items.",
+  "If an existing summary is provided, merge the new messages into it concisely without dropping important earlier details.",
+  "Write in the language of the conversation. Output only the summary text.",
 ].join("\n");
 
 const SEARCH_KB_TOOL: ToolDefinition = {
@@ -204,16 +212,39 @@ export function createBot(dependencies: BotDependencies): Bot {
   const selectConversationMessages = db.prepare<
     [string],
     {
+      id: number;
       role: "user" | "assistant";
       sender_open_id: string | null;
       sender_name: string | null;
       content: string;
     }
   >(
-    `SELECT role, sender_open_id, sender_name, content
+    `SELECT id, role, sender_open_id, sender_name, content
      FROM conversation_messages
      WHERE topic_id = ?
      ORDER BY id ASC`,
+  );
+  const selectConversationMessagesAfter = db.prepare<
+    [string, number],
+    {
+      id: number;
+      role: "user" | "assistant";
+      sender_open_id: string | null;
+      sender_name: string | null;
+      content: string;
+    }
+  >(
+    `SELECT id, role, sender_open_id, sender_name, content
+     FROM conversation_messages
+     WHERE topic_id = ? AND id > ?
+     ORDER BY id ASC`,
+  );
+  const selectConversationSummary = db.prepare<
+    [string],
+    { summary: string | null; summary_until_message_id: number | null }
+  >("SELECT summary, summary_until_message_id FROM conversations WHERE topic_id = ?");
+  const updateConversationSummary = db.prepare<[string, number, string]>(
+    "UPDATE conversations SET summary = ?, summary_until_message_id = ? WHERE topic_id = ?",
   );
 
   const findExistingDocByName = db.prepare<[string, string, string], { id: number }>(
@@ -238,14 +269,21 @@ export function createBot(dependencies: BotDependencies): Bot {
      VALUES (?, ?, ?)
      ON CONFLICT(repo_name) DO UPDATE SET last_synced_at = excluded.last_synced_at, branch = excluded.branch`,
   );
-  const insertIndexJob = db.prepare<[number, number]>(
-    "INSERT INTO index_jobs (document_id, status, created_at) VALUES (?, 'pending', ?)",
+  const insertIndexJob = db.prepare<[number, number, string | null, string | null]>(
+    "INSERT INTO index_jobs (document_id, status, created_at, notify_chat_id, notify_topic_id) VALUES (?, 'pending', ?, ?, ?)",
   );
   const selectPendingJobs = db.prepare<
     [],
-    { job_id: number; document_id: number; content: string }
+    {
+      job_id: number;
+      document_id: number;
+      doc_name: string;
+      content: string;
+      notify_chat_id: string | null;
+      notify_topic_id: string | null;
+    }
   >(
-    `SELECT j.id AS job_id, j.document_id, d.content
+    `SELECT j.id AS job_id, j.document_id, d.name AS doc_name, d.content, j.notify_chat_id, j.notify_topic_id
      FROM index_jobs j
      JOIN documents d ON d.id = j.document_id
      WHERE j.status = 'pending'
@@ -403,6 +441,8 @@ export function createBot(dependencies: BotDependencies): Bot {
       uploaderOpenId: string,
       content: string,
       nowMs: number,
+      notifyChatId: string | null,
+      notifyTopicId: string | null,
     ): number => {
       const existing = findExistingDocByName.get(kind, uploaderOpenId, name);
       if (existing) {
@@ -420,7 +460,7 @@ export function createBot(dependencies: BotDependencies): Bot {
         nowMs,
       );
       const docId = Number(result.lastInsertRowid);
-      insertIndexJob.run(docId, nowMs);
+      insertIndexJob.run(docId, nowMs, notifyChatId, notifyTopicId);
       return docId;
     },
   );
@@ -455,7 +495,7 @@ export function createBot(dependencies: BotDependencies): Bot {
           nowMs,
           nowMs,
         );
-        insertIndexJob.run(Number(result.lastInsertRowid), nowMs);
+        insertIndexJob.run(Number(result.lastInsertRowid), nowMs, null, null);
       }
       upsertRepoSyncState.run(repoName, nowMs, branch);
     },
@@ -560,8 +600,10 @@ export function createBot(dependencies: BotDependencies): Bot {
     return name ? `${name} (${openId})` : openId;
   }
 
-  function formatHistoryMessages(topicId: string): ChatMessage[] {
-    const rows = selectConversationMessages.all(topicId).slice(-MAX_HISTORY_MESSAGES);
+  function formatHistoryMessages(topicId: string, afterMessageId = 0): ChatMessage[] {
+    const rows = selectConversationMessagesAfter
+      .all(topicId, afterMessageId)
+      .slice(-MAX_HISTORY_MESSAGES);
     return rows.map((row) => {
       if (row.role === "assistant") {
         return { role: "assistant", content: row.content };
@@ -569,6 +611,59 @@ export function createBot(dependencies: BotDependencies): Bot {
       const speaker = row.sender_name ?? row.sender_open_id ?? "User";
       return { role: "user", content: `${speaker}: ${row.content}` };
     });
+  }
+
+  /** Rolling compaction: when unsummarized turns exceed MAX_HISTORY_MESSAGES, summarize older ones. */
+  async function compactConversationIfNeeded(
+    topicId: string,
+  ): Promise<{ summary: string | null; summaryUntilId: number }> {
+    const state = selectConversationSummary.get(topicId);
+    const existingSummary = state?.summary ?? null;
+    const summaryUntilId = state?.summary_until_message_id ?? 0;
+    const unsummarized = selectConversationMessagesAfter.all(topicId, summaryUntilId);
+    if (unsummarized.length <= MAX_HISTORY_MESSAGES) {
+      return { summary: existingSummary, summaryUntilId };
+    }
+
+    const toCompact = unsummarized.slice(0, unsummarized.length - RECENT_MESSAGES_TO_KEEP);
+    const lastCompacted = toCompact.at(-1);
+    if (!lastCompacted) {
+      return { summary: existingSummary, summaryUntilId };
+    }
+
+    const transcript = toCompact
+      .map((row) =>
+        row.role === "assistant"
+          ? `Assistant: ${row.content}`
+          : `${row.sender_name ?? row.sender_open_id ?? "User"}: ${row.content}`,
+      )
+      .join("\n");
+
+    const promptSections: string[] = [];
+    if (existingSummary) {
+      promptSections.push(`Existing summary:\n${existingSummary}`);
+    }
+    promptSections.push(`Messages to incorporate:\n${transcript}`);
+
+    try {
+      const response = await llm.chat({
+        model: settings.chatModel,
+        messages: [
+          { role: "system", content: SUMMARY_SYSTEM_PROMPT },
+          { role: "user", content: promptSections.join("\n\n") },
+        ],
+        tools: [],
+      });
+      const nextSummary = response.text?.trim();
+      if (nextSummary) {
+        updateConversationSummary.run(nextSummary, lastCompacted.id, topicId);
+        return { summary: nextSummary, summaryUntilId: lastCompacted.id };
+      }
+    } catch {
+      // Compaction failure must not block answering the current message.
+    }
+
+    return { summary: existingSummary, summaryUntilId };
   }
 
   async function ensureGroupCached(chatId: string): Promise<void> {
@@ -650,12 +745,28 @@ export function createBot(dependencies: BotDependencies): Bot {
     return result;
   }
 
+  async function notifyIndexResult(
+    chatId: string | null,
+    topicId: string | null,
+    text: string,
+  ): Promise<void> {
+    if (!chatId || !topicId) {
+      return;
+    }
+    try {
+      await feishu.replyInTopic({ chatId, topicId, text });
+    } catch {
+      // Do not fail background indexing if sending the notification fails.
+    }
+  }
+
   async function processIndexJobs(): Promise<void> {
     const jobs = selectPendingJobs.all();
     if (jobs.length === 0) {
       return;
     }
-    if (!(await llm.healthCheck())) {
+    const checkEmbedHealth = llm.embedHealthCheck ?? llm.healthCheck;
+    if (!(await checkEmbedHealth())) {
       return;
     }
     for (const job of jobs) {
@@ -664,27 +775,46 @@ export function createBot(dependencies: BotDependencies): Bot {
         const nowMs = clock.now().getTime();
         markDocumentIndexed.run(nowMs, job.document_id);
         markJobDone.run(nowMs, job.job_id);
+        await notifyIndexResult(
+          job.notify_chat_id,
+          job.notify_topic_id,
+          `Indexed ${job.doc_name} (empty document).`,
+        );
         continue;
       }
       let embeddings: number[][];
       try {
         embeddings = await embedInBatches(chunks.map((c) => c.content));
       } catch {
-        if (await llm.healthCheck()) {
+        if (await checkEmbedHealth()) {
           // The model is up, so this document is the problem: fail it instead of blocking the queue.
           const nowMs = clock.now().getTime();
           markDocumentFailed.run(nowMs, job.document_id);
           markJobFailed.run(nowMs, job.job_id);
+          await notifyIndexResult(
+            job.notify_chat_id,
+            job.notify_topic_id,
+            `Failed to index ${job.doc_name}.`,
+          );
           continue;
         }
         // The model went offline mid-indexing; leave the job pending for the next tick.
         return;
       }
       saveIndexedChunks(job.job_id, job.document_id, chunks, embeddings, clock.now().getTime());
+      const unit = chunks.length === 1 ? "chunk" : "chunks";
+      await notifyIndexResult(
+        job.notify_chat_id,
+        job.notify_topic_id,
+        `Indexed ${job.doc_name} (${chunks.length} ${unit}).`,
+      );
     }
   }
 
-  function buildSystemPrompt(askerOpenId: string): string {
+  function buildSystemPrompt(
+    askerOpenId: string,
+    conversationSummary: string | null = null,
+  ): string {
     const sections = [SYSTEM_PROMPT];
     const ownerMemories = selectMemoriesByUser.all(settings.ownerOpenId);
     if (ownerMemories.length > 0) {
@@ -697,6 +827,9 @@ export function createBot(dependencies: BotDependencies): Bot {
           `Current User's Memories:\n${askerMemories.map((m) => `- ${m.content}`).join("\n")}`,
         );
       }
+    }
+    if (conversationSummary) {
+      sections.push(`Earlier conversation summary:\n${conversationSummary}`);
     }
     return sections.join("\n\n");
   }
@@ -962,6 +1095,8 @@ export function createBot(dependencies: BotDependencies): Bot {
       event.sender.openId,
       content,
       clock.now().getTime(),
+      event.chatId,
+      topicId,
     );
 
     await feishu.replyInTopic({
@@ -1155,9 +1290,10 @@ export function createBot(dependencies: BotDependencies): Bot {
 
     await enqueueLlmWork(
       async () => {
+        const { summary, summaryUntilId } = await compactConversationIfNeeded(topicId);
         const messages: ChatMessage[] = [
-          { role: "system", content: buildSystemPrompt(message.sender.openId) },
-          ...formatHistoryMessages(topicId),
+          { role: "system", content: buildSystemPrompt(message.sender.openId, summary) },
+          ...formatHistoryMessages(topicId, summaryUntilId),
         ];
         const tools: ToolDefinition[] = [SEARCH_KB_TOOL, PROPOSE_MEMORY_TOOL, ESCALATE_TOOL];
         const citedSources = new Set<string>();
@@ -1186,7 +1322,13 @@ export function createBot(dependencies: BotDependencies): Bot {
             for (const call of response.toolCalls) {
               if (call.name === "search_knowledge_base") {
                 const query = typeof call.arguments.query === "string" ? call.arguments.query : "";
-                const [queryEmbedding] = await llm.embed([query]);
+                let queryEmbedding: number[] | undefined;
+                let embedUnavailable = false;
+                try {
+                  [queryEmbedding] = await llm.embed([query]);
+                } catch {
+                  embedUnavailable = true;
+                }
                 const hits = queryEmbedding
                   ? message.chatType === "private" && message.sender.openId !== settings.ownerOpenId
                     ? searchKbWithSupplementaryChunks.all(
@@ -1204,8 +1346,9 @@ export function createBot(dependencies: BotDependencies): Bot {
                   role: "tool",
                   toolCallId: call.id,
                   name: call.name,
-                  content:
-                    formattedHits.length > 0
+                  content: embedUnavailable
+                    ? "Knowledge Base search is currently unavailable because the embedding service is offline."
+                    : formattedHits.length > 0
                       ? formattedHits.join("\n\n")
                       : "No relevant documents found in the Knowledge Base.",
                 });

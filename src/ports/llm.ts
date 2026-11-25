@@ -42,4 +42,6 @@ export type LlmPort = {
   chat(request: ChatRequest): Promise<ChatResponse>;
   embed(texts: string[]): Promise<number[][]>;
   healthCheck(): Promise<boolean>;
+  /** Optional separate health check for embeddings when chat and embedding use different providers. */
+  embedHealthCheck?(): Promise<boolean>;
 };

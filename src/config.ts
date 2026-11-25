@@ -22,15 +22,29 @@ const repositorySchema = z
     return match[1];
   });
 
+const chatProviderSchema = z.enum(["ollama", "codebuddy-cli"]);
+
+const codebuddyConfigSchema = z.object({
+  command: z.string().min(1).default("codebuddy"),
+  extraArgs: z.array(z.string()).default([]),
+  timeoutMs: z.number().int().positive().default(180_000),
+});
+
 const configFileSchema = z.object({
   owner: z.object({
     openId: z.string().min(1),
   }),
   repositories: z.array(repositorySchema).default([]),
   bot: z.object({
+    chatProvider: chatProviderSchema.default("ollama"),
     chatModel: z.string().min(1),
     embeddingModel: z.string().min(1),
     contextTokens: z.number().int().positive().default(32768),
+    codebuddy: codebuddyConfigSchema.default({
+      command: "codebuddy",
+      extraArgs: [],
+      timeoutMs: 180_000,
+    }),
   }),
   rateLimit: z
     .object({
@@ -54,10 +68,22 @@ const environmentSchema = z.object({
   FEISHU_APP_SECRET: z.string().min(1),
   FEISHU_DOMAIN: z.enum(["feishu", "lark"]).default("feishu"),
   FEISHU_BOT_OPEN_ID: z.string().optional(),
-  OLLAMA_URL: z.string().url(),
+  OLLAMA_URL: z
+    .string()
+    .optional()
+    .transform((value) => (value?.trim() ? value.trim() : undefined))
+    .pipe(z.string().url().optional()),
   OLLAMA_API_KEY: z.string().optional(),
   GITHUB_TOKEN: z.string().optional(),
 });
+
+export type ChatProvider = z.infer<typeof chatProviderSchema>;
+
+export type CodeBuddyConfig = {
+  command: string;
+  extraArgs: string[];
+  timeoutMs: number;
+};
 
 export type RateLimitConfig = {
   maxRequests: number;
@@ -72,9 +98,11 @@ export type MemoryConfig = {
 export type Config = {
   ownerOpenId: string;
   repositories: string[];
+  chatProvider: ChatProvider;
   chatModel: string;
   embeddingModel: string;
   contextTokens: number;
+  codebuddy: CodeBuddyConfig;
   rateLimit: RateLimitConfig;
   memory: MemoryConfig;
   databasePath: string;
@@ -85,7 +113,7 @@ export type Config = {
     botOpenId: string | undefined;
   };
   ollama: {
-    url: string;
+    url: string | undefined;
     apiKey: string | undefined;
   };
   github: {
@@ -98,12 +126,18 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Config
   const file = configFileSchema.parse(parseYaml(readFileSync(configPath, "utf8")));
   const env = environmentSchema.parse(environment);
 
+  if (file.bot.chatProvider === "ollama" && !env.OLLAMA_URL) {
+    throw new Error('OLLAMA_URL is required when bot.chatProvider is "ollama"');
+  }
+
   return {
     ownerOpenId: file.owner.openId,
     repositories: file.repositories,
+    chatProvider: file.bot.chatProvider,
     chatModel: file.bot.chatModel,
     embeddingModel: file.bot.embeddingModel,
     contextTokens: file.bot.contextTokens,
+    codebuddy: file.bot.codebuddy,
     rateLimit: file.rateLimit,
     memory: file.memory,
     databasePath: file.storage.database,
