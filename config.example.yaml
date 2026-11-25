@@ -7,7 +7,7 @@ repositories:
   - owner/private-repo
 
 bot:
-  chatModel: qwen3:14b
+  chatModel: qwen3.6:35b-a3b
   embeddingModel: bge-m3
   # Ollama num_ctx for chat requests
   contextTokens: 32768

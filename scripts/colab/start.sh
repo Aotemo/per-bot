@@ -9,7 +9,7 @@ set -euo pipefail
 
 DRIVE_DIR=${DRIVE_DIR:-/content/drive/MyDrive/per_bot_ollama}
 LOCAL_MODELS=/content/models
-MODELS=${MODELS:-"qwen3:14b bge-m3"}
+MODELS=${MODELS:-"qwen3.6:35b-a3b bge-m3"}
 TARBALL=/content/ollama-linux-amd64.tar.zst
 
 drive_mounted() { mountpoint -q /content/drive; }
@@ -66,7 +66,7 @@ fi
 # Chat model first: loading it second evicts the embedding model on a T4.
 echo "Warming up"
 curl -fs http://127.0.0.1:11434/api/chat \
-  -d "{\"model\":\"${CHAT_MODEL:-qwen3:14b}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false,\"think\":false,\"options\":{\"num_ctx\":${CONTEXT_TOKENS:-32768}}}" >/dev/null
+  -d "{\"model\":\"${CHAT_MODEL:-qwen3.6:35b-a3b}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false,\"think\":false,\"options\":{\"num_ctx\":${CONTEXT_TOKENS:-32768}}}" >/dev/null
 curl -fs http://127.0.0.1:11434/api/embed -d '{"model":"bge-m3","input":["warm up"]}' >/dev/null
 ollama ps
 
