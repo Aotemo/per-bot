@@ -17,26 +17,41 @@ export type GitRepositorySyncOptions = {
   resolveCloneUrl?: (repository: string) => string;
 };
 
-async function git(args: string[], cwd?: string): Promise<string> {
-  const { stdout } = await execFileAsync("git", args, {
-    cwd,
-    maxBuffer: 10 * 1024 * 1024,
-  });
-  return stdout.trim();
-}
-
 export function createGitRepositorySync(options: GitRepositorySyncOptions): RepositorySyncPort {
   const resolveUrl =
     options.resolveCloneUrl ?? ((repository: string) => `https://github.com/${repository}.git`);
-  // Passed per command so the token is never written into the clone's .git/config.
-  const authArgs = options.githubToken
-    ? [
-        "-c",
-        `http.https://github.com/.extraheader=AUTHORIZATION: basic ${Buffer.from(
-          `x-access-token:${options.githubToken}`,
-        ).toString("base64")}`,
-      ]
-    : [];
+
+  const secrets: string[] = [];
+  // Never prompt for credentials: a background sync would hang forever.
+  const gitEnv: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+  if (options.githubToken) {
+    const basicAuth = Buffer.from(`x-access-token:${options.githubToken}`).toString("base64");
+    secrets.push(options.githubToken, basicAuth);
+    // Passed through the environment rather than argv so it is not visible in `ps` or in
+    // Node's "Command failed" errors, and is never written into the clone's .git/config.
+    gitEnv.GIT_CONFIG_COUNT = "1";
+    gitEnv.GIT_CONFIG_KEY_0 = "http.https://github.com/.extraheader";
+    gitEnv.GIT_CONFIG_VALUE_0 = `AUTHORIZATION: basic ${basicAuth}`;
+  }
+
+  async function git(args: string[], cwd?: string): Promise<string> {
+    try {
+      const { stdout } = await execFileAsync("git", args, {
+        cwd,
+        env: gitEnv,
+        maxBuffer: 10 * 1024 * 1024,
+      });
+      return stdout.trim();
+    } catch (error) {
+      // Rethrow without the original error, whose cmd/stack could carry credentials.
+      const stderr =
+        typeof error === "object" && error !== null && "stderr" in error
+          ? String(error.stderr).trim()
+          : String(error);
+      const redacted = secrets.reduce((text, secret) => text.replaceAll(secret, "***"), stderr);
+      throw new Error(`git ${args[0]} failed: ${redacted}`);
+    }
+  }
 
   return {
     async sync(repository: string): Promise<RepositorySyncResult> {
@@ -46,9 +61,9 @@ export function createGitRepositorySync(options: GitRepositorySyncOptions): Repo
       const shaMarkerPath = join(options.cloneRoot, `${safeDirName}.last_sha`);
 
       if (!existsSync(join(repoDir, ".git"))) {
-        await git([...authArgs, "clone", "--quiet", resolveUrl(repository), repoDir]);
+        await git(["clone", "--quiet", resolveUrl(repository), repoDir]);
       } else {
-        await git([...authArgs, "pull", "--ff-only", "--quiet"], repoDir);
+        await git(["pull", "--ff-only", "--quiet"], repoDir);
       }
 
       const branch = (await git(["rev-parse", "--abbrev-ref", "HEAD"], repoDir)) || "main";

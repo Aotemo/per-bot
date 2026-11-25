@@ -605,19 +605,32 @@ export function createBot(dependencies: BotDependencies): Bot {
     return false;
   }
 
-  async function syncRepositories(): Promise<void> {
-    if (repositories.length === 0) {
-      return;
-    }
+  /** Failed repositories wait a full sync interval before retrying instead of failing every tick. */
+  const repoFailedAt = new Map<string, number>();
+
+  /** Syncs each due repository independently; returns the failures instead of stopping at the first. */
+  async function syncRepositories(): Promise<Error[]> {
+    const failures: Error[] = [];
     const nowMs = clock.now().getTime();
     for (const repo of repositories) {
       const state = selectRepoSyncState.get(repo);
       if (state && nowMs - state.last_synced_at < syncIntervalMs) {
         continue;
       }
-      const result = await repositorySync.sync(repo);
-      applyRepositorySync(repo, result.branch, result.changedFiles, result.deletedFiles, nowMs);
+      const failedAt = repoFailedAt.get(repo);
+      if (failedAt !== undefined && nowMs - failedAt < syncIntervalMs) {
+        continue;
+      }
+      try {
+        const result = await repositorySync.sync(repo);
+        applyRepositorySync(repo, result.branch, result.changedFiles, result.deletedFiles, nowMs);
+        repoFailedAt.delete(repo);
+      } catch (error) {
+        repoFailedAt.set(repo, nowMs);
+        failures.push(new Error(`Repository sync for ${repo} failed`, { cause: error }));
+      }
     }
+    return failures;
   }
 
   /** Embeds through the global LLM queue in small batches so indexing never competes with chat for the GPU. */
@@ -1448,14 +1461,31 @@ export function createBot(dependencies: BotDependencies): Bot {
         return;
       }
       tickRunning = true;
+      // Each step runs even if an earlier one failed; failures are reported together at the end.
+      const failures: unknown[] = [];
+      const attempt = async (step: () => Promise<void>) => {
+        try {
+          await step();
+        } catch (error) {
+          failures.push(error);
+        }
+      };
       try {
         const nowMs = clock.now().getTime();
         expirePendingProposals.run(nowMs, nowMs);
-        await syncRepositories();
-        await processIndexJobs();
-        await runIdleExtractions();
+        await attempt(async () => {
+          failures.push(...(await syncRepositories()));
+        });
+        await attempt(processIndexJobs);
+        await attempt(runIdleExtractions);
       } finally {
         tickRunning = false;
+      }
+      if (failures.length === 1) {
+        throw failures[0];
+      }
+      if (failures.length > 1) {
+        throw new AggregateError(failures, "Background tick had failures");
       }
     },
   };

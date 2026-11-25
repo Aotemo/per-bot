@@ -771,6 +771,47 @@ describe("bot core — Repository sync from private GitHub repos (#7)", () => {
     await bot.tick();
     expect(llm.embedCalls.length).toBe(2);
   });
+
+  it("keeps indexing and syncing other repositories when one repository fails, and retries it only after the sync interval", async () => {
+    const attempts: string[] = [];
+    const repositorySync: RepositorySyncPort = {
+      async sync(repository) {
+        attempts.push(repository);
+        if (repository === "owner/broken") {
+          throw new Error("Authentication failed");
+        }
+        return {
+          branch: "main",
+          changedFiles: [{ path: "README.md", content: "# Good\nport 7070\n" }],
+          deletedFiles: [],
+        };
+      },
+    };
+    const { bot, feishu, clock, storage } = buildBot([], {
+      settings: { repositories: ["owner/broken", "owner/good"] },
+      repositorySync,
+    });
+    feishu.files.set("file_key_1", Buffer.from("# Deploy\nThe service listens on port 8080.\n"));
+    await bot.handle(fileEvent());
+
+    await expect(bot.tick()).rejects.toThrow(/owner\/broken/);
+    expect(attempts).toEqual(["owner/broken", "owner/good"]);
+    const statuses = storage.db
+      .prepare("SELECT name, status FROM documents ORDER BY name")
+      .all() as Array<{ name: string; status: string }>;
+    expect(statuses).toEqual([
+      { name: "deploy.md", status: "indexed" },
+      { name: "owner/good/README.md", status: "indexed" },
+    ]);
+
+    clock.advance(30_000);
+    await bot.tick();
+    expect(attempts).toHaveLength(2);
+
+    clock.advance(60 * 60 * 1000);
+    await expect(bot.tick()).rejects.toThrow(/owner\/broken/);
+    expect(attempts).toEqual(["owner/broken", "owner/good", "owner/broken", "owner/good"]);
+  });
 });
 
 describe("bot core — Supplementary Documents (#8)", () => {
